@@ -10,8 +10,22 @@ repository-specific logic out; pass them in as inputs.
 
 | Path | Kind | What it does |
 |---|---|---|
-| `release-app-token` | composite action | Mints a token for the org's `webtree-release` GitHub App, scoped to the calling repository. |
-| `.github/workflows/release-please.yml` | reusable workflow | Runs release-please with that token, so release PRs get their checks without approval and release tags start `push: tags` workflows. |
+| `app-token-from-ssm` | composite action | Mints a GitHub App token from an App id and key in AWS SSM, read through an OIDC role. |
+| `.github/workflows/release-please.yml` | reusable workflow | Runs release-please as a GitHub App, so release PRs get their checks without approval and release tags start `push: tags` workflows. |
+
+## Secrets and environments
+
+Nothing here holds an account id, role, parameter name or hostname: callers pass them
+as inputs, and anything that grants access comes from a secret.
+
+Put such secrets in an **environment**, not the repository, and give the environment a
+deployment branch policy that admits only the branches that need them (for a release,
+`main`). A job on any other branch, or from a fork, then cannot read them. For AWS,
+trust the environment's OIDC subject (`repo:<owner>/<repo>:environment:<name>`), not a
+branch subject, so the GitHub-side policy and the AWS trust agree.
+
+A reusable workflow reads environment secrets only in a job that names the
+environment, and only when the caller passes `secrets: inherit`.
 
 ### release-please
 
@@ -23,33 +37,38 @@ on:
 jobs:
   release-please:
     permissions:
-      id-token: write
+      id-token: write   # AWS_ROLE only
     uses: Web-tree/actions/.github/workflows/release-please.yml@v1
+    secrets: inherit
 ```
+
+Secrets of the `release` environment (input `environment`), one of:
+
+- `APP_ID` and `APP_PRIVATE_KEY`: the App's id and private key;
+- `AWS_ROLE`: an OIDC role that reads them from SSM, with inputs `aws-region`,
+  `app-id-parameter` and `private-key-parameter`.
 
 Outputs: `release_created`, `releases_created`, `tag_name`, `version`, `paths_released`,
 `prs_created`, `pr`, and `outputs` (everything release-please returned, as JSON).
 
-### release-app-token
+### app-token-from-ssm
 
 ```yaml
+environment: release
 permissions:
   id-token: write
 steps:
-  - uses: Web-tree/actions/release-app-token@v1
+  - uses: Web-tree/actions/app-token-from-ssm@v1
     id: app
+    with:
+      aws-role: ${{ secrets.AWS_ROLE }}
+      aws-region: eu-central-1
+      app-id-parameter: /my/app/app-id
+      private-key-parameter: /my/app/private-key
   - run: gh pr list
     env:
       GH_TOKEN: ${{ steps.app.outputs.token }}
 ```
-
-### Enabling a repository
-
-The token comes from AWS SSM through an OIDC role that reads only the App's id and key.
-Add the repository's subject, normally `repo:Web-tree/<repo>:ref:refs/heads/main`, to
-`webtree-release-app` in `github_ssm_reader_roles`
-(`Web-tree/infrastructure`, `tf/aws/accounts/prod/modules.tf`). Never add a
-`pull_request` subject: the key is org-wide.
 
 ## Versioning
 

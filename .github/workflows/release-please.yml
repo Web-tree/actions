@@ -1,17 +1,22 @@
-# Runs release-please as the webtree-release App (release-app-token), so the release
-# PR it opens or updates gets its pull_request checks with no approval and no
-# workflow_dispatch, and the tag it makes starts the caller's `push: tags` workflows.
+# Runs release-please as a GitHub App, so the release PR it opens or updates gets its
+# pull_request checks with no "Approve workflows to run", and the tag it makes starts
+# the caller's `push: tags` workflows. A GITHUB_TOKEN push does neither.
+#
+# The App's credentials come from secrets of the job's environment (`environment`,
+# default `release`). Give that environment a deployment branch policy that admits
+# only the release branch, so no other branch or fork PR can read them. Either:
+#   APP_ID + APP_PRIVATE_KEY   the App's id and private key, or
+#   AWS_ROLE                   an OIDC role that reads them from SSM Parameter Store
+#                              (inputs app-id-parameter, private-key-parameter, aws-region).
 #
 # Caller, on push to the release branch:
 #
 #   jobs:
 #     release-please:
 #       permissions:
-#         id-token: write
+#         id-token: write   # AWS_ROLE only
 #       uses: Web-tree/actions/.github/workflows/release-please.yml@v1
-#
-# The caller's repo must be a subject of the webtree-release-app SSM reader role
-# (see release-app-token/action.yml).
+#       secrets: inherit    # environment secrets reach the called job only this way
 name: release-please
 
 on:
@@ -30,6 +35,29 @@ on:
       runs-on:
         type: string
         default: ubuntu-latest
+      environment:
+        description: Environment whose secrets hold the App's credentials.
+        type: string
+        default: release
+      aws-region:
+        description: Region of the SSM parameters (AWS_ROLE only).
+        type: string
+        default: ""
+      app-id-parameter:
+        description: SSM parameter holding the App id (AWS_ROLE only).
+        type: string
+        default: ""
+      private-key-parameter:
+        description: SSM parameter holding the App's private key (AWS_ROLE only).
+        type: string
+        default: ""
+    secrets:
+      APP_ID:
+        required: false
+      APP_PRIVATE_KEY:
+        required: false
+      AWS_ROLE:
+        required: false
     outputs:
       release_created:
         description: "'true' when this run made the release of the root package"
@@ -61,11 +89,15 @@ permissions: {}
 jobs:
   release-please:
     runs-on: ${{ inputs.runs-on }}
+    environment: ${{ inputs.environment }}
     # Never cancelled: a later run finds a merged release PR this one skipped and releases it.
     concurrency:
       group: release-please-${{ github.repository }}
     permissions:
       id-token: write
+    env:
+      # `if:` cannot read secrets.
+      CREDENTIALS: ${{ secrets.APP_PRIVATE_KEY != '' && 'secrets' || secrets.AWS_ROLE != '' && 'ssm' || '' }}
     outputs:
       release_created: ${{ steps.rp.outputs.release_created }}
       releases_created: ${{ steps.rp.outputs.releases_created }}
@@ -76,12 +108,31 @@ jobs:
       pr: ${{ steps.rp.outputs.pr }}
       outputs: ${{ toJSON(steps.rp.outputs) }}
     steps:
-      - uses: Web-tree/actions/release-app-token@v1
-        id: app
+      - name: Require App credentials
+        if: env.CREDENTIALS == ''
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          echo "::error::environment '$ENVIRONMENT' has neither APP_ID + APP_PRIVATE_KEY nor AWS_ROLE, or the caller does not pass 'secrets: inherit'"
+          exit 1
+      - if: env.CREDENTIALS == 'secrets'
+        uses: actions/create-github-app-token@v3
+        id: app-secrets
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+      - if: env.CREDENTIALS == 'ssm'
+        uses: Web-tree/actions/app-token-from-ssm@v1
+        id: app-ssm
+        with:
+          aws-role: ${{ secrets.AWS_ROLE }}
+          aws-region: ${{ inputs.aws-region }}
+          app-id-parameter: ${{ inputs.app-id-parameter }}
+          private-key-parameter: ${{ inputs.private-key-parameter }}
       - uses: googleapis/release-please-action@v5
         id: rp
         with:
-          token: ${{ steps.app.outputs.token }}
+          token: ${{ steps.app-secrets.outputs.token || steps.app-ssm.outputs.token }}
           config-file: ${{ inputs.config-file }}
           manifest-file: ${{ inputs.manifest-file }}
           target-branch: ${{ inputs.target-branch }}
