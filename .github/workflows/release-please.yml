@@ -1,0 +1,87 @@
+# Runs release-please as the webtree-release App (release-app-token), so the release
+# PR it opens or updates gets its pull_request checks with no approval and no
+# workflow_dispatch, and the tag it makes starts the caller's `push: tags` workflows.
+#
+# Caller, on push to the release branch:
+#
+#   jobs:
+#     release-please:
+#       permissions:
+#         id-token: write
+#       uses: Web-tree/actions/.github/workflows/release-please.yml@v1
+#
+# The caller's repo must be a subject of the webtree-release-app SSM reader role
+# (see release-app-token/action.yml).
+name: release-please
+
+on:
+  workflow_call:
+    inputs:
+      config-file:
+        type: string
+        default: release-please-config.json
+      manifest-file:
+        type: string
+        default: .release-please-manifest.json
+      target-branch:
+        description: Branch release-please releases from. Empty means the repository's default branch.
+        type: string
+        default: ""
+      runs-on:
+        type: string
+        default: ubuntu-latest
+    outputs:
+      release_created:
+        description: "'true' when this run made the release of the root package"
+        value: ${{ jobs.release-please.outputs.release_created }}
+      releases_created:
+        description: "'true' when this run made any release"
+        value: ${{ jobs.release-please.outputs.releases_created }}
+      tag_name:
+        description: Tag of the root package's release
+        value: ${{ jobs.release-please.outputs.tag_name }}
+      version:
+        description: Version of the root package's release
+        value: ${{ jobs.release-please.outputs.version }}
+      paths_released:
+        description: JSON array of the package paths released
+        value: ${{ jobs.release-please.outputs.paths_released }}
+      prs_created:
+        description: "'true' when this run opened or updated a release PR"
+        value: ${{ jobs.release-please.outputs.prs_created }}
+      pr:
+        description: JSON of the release PR
+        value: ${{ jobs.release-please.outputs.pr }}
+      outputs:
+        description: All of release-please's outputs as one JSON object, for per-package keys of a monorepo
+        value: ${{ jobs.release-please.outputs.outputs }}
+
+permissions: {}
+
+jobs:
+  release-please:
+    runs-on: ${{ inputs.runs-on }}
+    # Never cancelled: a later run finds a merged release PR this one skipped and releases it.
+    concurrency:
+      group: release-please-${{ github.repository }}
+    permissions:
+      id-token: write
+    outputs:
+      release_created: ${{ steps.rp.outputs.release_created }}
+      releases_created: ${{ steps.rp.outputs.releases_created }}
+      tag_name: ${{ steps.rp.outputs.tag_name }}
+      version: ${{ steps.rp.outputs.version }}
+      paths_released: ${{ steps.rp.outputs.paths_released }}
+      prs_created: ${{ steps.rp.outputs.prs_created }}
+      pr: ${{ steps.rp.outputs.pr }}
+      outputs: ${{ toJSON(steps.rp.outputs) }}
+    steps:
+      - uses: Web-tree/actions/release-app-token@v1
+        id: app
+      - uses: googleapis/release-please-action@v5
+        id: rp
+        with:
+          token: ${{ steps.app.outputs.token }}
+          config-file: ${{ inputs.config-file }}
+          manifest-file: ${{ inputs.manifest-file }}
+          target-branch: ${{ inputs.target-branch }}

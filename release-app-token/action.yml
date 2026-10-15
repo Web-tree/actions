@@ -1,0 +1,87 @@
+# Mints a token for the org's webtree-release GitHub App, scoped to the calling repo.
+#
+# Pushes, PRs and tags made with this token start workflows like a person's would.
+# Made with GITHUB_TOKEN they start none, or wait for "Approve workflows to run".
+#
+# The App's id and key live in SSM (infrastructure/github-apps/apps.yaml). The job
+# reads them through an OIDC role that may read those two parameters and nothing else
+# (github_ssm_reader_roles in infrastructure/tf/aws/accounts/prod/modules.tf); a repo
+# must be listed in that role's subjects before this action works there.
+#
+# The calling job needs `permissions: id-token: write`.
+name: webtree-release App token
+description: Mints a webtree-release GitHub App token for the calling repository.
+
+inputs:
+  role-to-assume:
+    description: IAM role that may read the App's SSM parameters. Empty uses the shared webtree-release-app role.
+    required: false
+    default: ""
+  aws-region:
+    description: Region of the SSM parameters.
+    required: false
+    default: eu-central-1
+  repositories:
+    description: Repositories the token may touch, comma or newline separated. Empty means the calling repository only.
+    required: false
+    default: ""
+
+outputs:
+  token:
+    description: The App installation token. It expires after an hour.
+    value: ${{ steps.token.outputs.token }}
+  app-slug:
+    description: The App's slug, for a commit author or a bot login.
+    value: ${{ steps.token.outputs.app-slug }}
+
+runs:
+  using: composite
+  steps:
+    # GitHub-hosted runners have it; ARC runner images do not.
+    - name: Install AWS CLI
+      shell: bash
+      run: |
+        if ! command -v aws >/dev/null 2>&1; then
+          curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "$RUNNER_TEMP/awscliv2.zip"
+          (cd "$RUNNER_TEMP" && unzip -q awscliv2.zip && sudo ./aws/install)
+        fi
+
+    - uses: aws-actions/configure-aws-credentials@v6
+      with:
+        role-to-assume: ${{ inputs.role-to-assume || 'arn:aws:iam::084375558068:role/github-oidc-ssm-webtree-release-app' }}
+        aws-region: ${{ inputs.aws-region }}
+
+    - name: Read App credentials
+      id: creds
+      shell: bash
+      run: |
+        set -euo pipefail
+        app_id=$(aws ssm get-parameter --name /webtree/github/apps/webtree-release/app-id \
+          --query 'Parameter.Value' --output text)
+        private_key=$(aws ssm get-parameter --name /webtree/github/apps/webtree-release/private-key \
+          --with-decryption --query 'Parameter.Value' --output text)
+        while IFS= read -r line; do
+          [ -n "$line" ] && echo "::add-mask::$line"
+        done <<< "$private_key"
+        # A step output, not GITHUB_ENV: the org-wide key must not reach the caller's later steps.
+        delim="EOF_${RANDOM}_${RANDOM}"
+        {
+          echo "app-id=$app_id"
+          echo "private-key<<$delim"
+          echo "$private_key"
+          echo "$delim"
+        } >> "$GITHUB_OUTPUT"
+        # The role is needed only for the read above.
+        {
+          echo "AWS_ACCESS_KEY_ID="
+          echo "AWS_SECRET_ACCESS_KEY="
+          echo "AWS_SESSION_TOKEN="
+        } >> "$GITHUB_ENV"
+
+    - uses: actions/create-github-app-token@v3
+      id: token
+      with:
+        app-id: ${{ steps.creds.outputs.app-id }}
+        private-key: ${{ steps.creds.outputs.private-key }}
+        owner: ${{ github.repository_owner }}
+        repositories: ${{ inputs.repositories || github.event.repository.name }}
