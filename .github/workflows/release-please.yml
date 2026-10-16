@@ -14,9 +14,13 @@
 #   jobs:
 #     release-please:
 #       permissions:
-#         id-token: write   # AWS_ROLE only
+#         id-token: write       # AWS_ROLE only
+#         checks: read          # auto-merge reads the release PR's required checks
+#         pull-requests: read
 #       uses: Web-tree/actions/.github/workflows/release-please.yml@v1
-#       secrets: inherit    # environment secrets reach the called job only this way
+#       with:
+#         auto-merge: true      # every release PR merges itself once its required checks pass
+#       secrets: inherit        # environment secrets reach the called job only this way
 name: release-please
 
 on:
@@ -35,6 +39,14 @@ on:
       runs-on:
         type: string
         default: ubuntu-latest
+      auto-merge:
+        description: Merge each open release PR once its required checks pass, so every releasable change is released.
+        type: boolean
+        default: false
+      merge-method:
+        description: MERGE, SQUASH or REBASE, for auto-merge.
+        type: string
+        default: SQUASH
       environment:
         description: Environment whose secrets hold the App's credentials.
         type: string
@@ -95,6 +107,8 @@ jobs:
       group: release-please-${{ github.repository }}
     permissions:
       id-token: write
+      checks: read
+      pull-requests: read
     env:
       # `if:` cannot read secrets.
       CREDENTIALS: ${{ secrets.APP_PRIVATE_KEY != '' && 'secrets' || secrets.AWS_ROLE != '' && 'ssm' || '' }}
@@ -136,3 +150,44 @@ jobs:
           config-file: ${{ inputs.config-file }}
           manifest-file: ${{ inputs.manifest-file }}
           target-branch: ${{ inputs.target-branch }}
+
+      # GitHub's auto-merge, not a direct merge: it waits for the branch's required checks
+      # and reviews, which an App that bypasses rulesets would otherwise skip. Every open
+      # release PR, not only one this run touched: release-please reports nothing for a PR
+      # it left unchanged.
+      - name: Auto-merge release PRs
+        if: inputs.auto-merge
+        env:
+          GH_TOKEN: ${{ steps.app-secrets.outputs.token || steps.app-ssm.outputs.token }}
+          # The App needs no checks permission: GITHUB_TOKEN reads them.
+          CHECKS_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BASE: ${{ inputs.target-branch || github.event.repository.default_branch }}
+          METHOD: ${{ inputs.merge-method }}
+        run: |
+          set -euo pipefail
+          case "$METHOD" in MERGE|SQUASH|REBASE) ;; *) echo "::error::merge-method must be MERGE, SQUASH or REBASE, got '$METHOD'"; exit 1 ;; esac
+          prs=$(gh pr list --repo "$REPO" --state open --base "$BASE" --label 'autorelease: pending' \
+            --json id,number,headRefName,isCrossRepository,autoMergeRequest \
+            --jq '.[] | select((.headRefName | startswith("release-please--")) and (.isCrossRepository | not) and .autoMergeRequest == null) | "\(.number) \(.id)"')
+          while read -r pr id; do
+            [ -n "$pr" ] || continue
+            # shellcheck disable=SC2016  # $id and $method are GraphQL variables
+            if out=$(gh api graphql -f id="$id" -f method="$METHOD" -f query='
+              mutation($id: ID!, $method: PullRequestMergeMethod!) {
+                enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: $method}) { clientMutationId }
+              }' 2>&1); then
+              echo "#$pr: auto-merge on"
+              continue
+            fi
+            echo "$out"
+            # GitHub refuses auto-merge on a PR that can merge already: merge it now, once its
+            # required checks have passed, pinned to the head they passed on.
+            grep -qE '(clean|unstable) status' <<< "$out" || exit 1
+            head=$(gh pr view "$pr" --repo "$REPO" --json headRefOid --jq .headRefOid)
+            if ! checks=$(GH_TOKEN="$CHECKS_TOKEN" gh pr checks "$pr" --repo "$REPO" --required 2>&1); then
+              grep -q 'no required checks' <<< "$checks" || { echo "$checks"; exit 1; }
+            fi
+            gh pr merge "$pr" --repo "$REPO" "--$(tr '[:upper:]' '[:lower:]' <<< "$METHOD")" --match-head-commit "$head"
+            echo "#$pr: merged"
+          done <<< "$prs"

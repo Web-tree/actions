@@ -37,10 +37,21 @@ on:
 jobs:
   release-please:
     permissions:
-      id-token: write   # AWS_ROLE only
+      id-token: write       # AWS_ROLE only
+      checks: read
+      pull-requests: read
     uses: Web-tree/actions/.github/workflows/release-please.yml@v1
+    with:
+      auto-merge: true      # optional: release every releasable change
     secrets: inherit
 ```
+
+The caller job must grant `checks: read` and `pull-requests: read` (from v1.2.0): a called
+job cannot hold a permission its caller did not grant.
+
+With `auto-merge: true`, each open release PR gets GitHub's auto-merge, so it merges once
+its required checks and reviews pass, and that merge makes the release. The repository
+must allow auto-merge.
 
 Secrets of the `release` environment (input `environment`), one of:
 
